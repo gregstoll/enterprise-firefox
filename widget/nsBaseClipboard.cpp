@@ -6,6 +6,7 @@
 
 #include "ContentAnalysis.h"
 #include "mozilla/AutoRestore.h"
+#include "mozilla/ClearOnShutdown.h"
 #include "mozilla/Components.h"
 #include "mozilla/ErrorResult.h"
 #include "mozilla/RefPtr.h"
@@ -14,6 +15,7 @@
 #include "mozilla/StaticPrefs_clipboard.h"
 #include "mozilla/StaticPrefs_dom.h"
 #include "mozilla/StaticPrefs_widget.h"
+#include "mozilla/StaticPtr.h"
 #include "mozilla/dom/BindingUtils.h"
 #include "mozilla/dom/CanonicalBrowsingContext.h"
 #include "mozilla/dom/Document.h"
@@ -29,6 +31,9 @@
 #include "nsFocusManager.h"
 #include "nsIClipboardOwner.h"
 #include "nsIMutableArray.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsIPrincipal.h"
 #include "nsIPromptService.h"
 #include "nsISupportsPrimitives.h"
 #include "nsXPCOM.h"
@@ -210,6 +215,74 @@ void UserConfirmationRequest::RejectedCallback(JSContext* aCx,
   RejectPendingClipboardGetRequests(NS_ERROR_FAILURE);
 }
 
+constexpr char kLastPrivateBrowsingContextExited[] = "last-pb-context-exited";
+
+// Runs a callback when the last private window closes. Only the global
+// clipboard cache ever holds data that is not on the native clipboard, so one
+// callback suffices.
+class PrivateBrowsingExitObserver final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+
+  using Callback = mozilla::MoveOnlyFunction<void()>;
+
+  static PrivateBrowsingExitObserver* Get() {
+    if (!sInstance) {
+      sInstance = new PrivateBrowsingExitObserver();
+      mozilla::ClearOnShutdown(&sInstance);
+    }
+    return sInstance;
+  }
+  static PrivateBrowsingExitObserver* GetIfExists() { return sInstance; }
+
+  void Start(Callback&& aCallback) {
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (!obs) {
+      return;
+    }
+    if (!mCallback) {
+      obs->AddObserver(this, kLastPrivateBrowsingContextExited, false);
+    }
+    mCallback = std::move(aCallback);
+  }
+
+  void Stop() {
+    if (!mCallback) {
+      return;
+    }
+    mCallback = nullptr;
+    if (nsCOMPtr<nsIObserverService> obs =
+            mozilla::services::GetObserverService()) {
+      obs->RemoveObserver(this, kLastPrivateBrowsingContextExited);
+    }
+  }
+
+  NS_IMETHOD Observe(nsISupports*, const char* aTopic,
+                     const char16_t*) override {
+    if (mCallback && !strcmp(aTopic, kLastPrivateBrowsingContextExited)) {
+      // The callback is expected to call Stop(), so move it out first.
+      Callback callback = std::move(mCallback);
+      if (nsCOMPtr<nsIObserverService> obs =
+              mozilla::services::GetObserverService()) {
+        obs->RemoveObserver(this, kLastPrivateBrowsingContextExited);
+      }
+      callback();
+    }
+    return NS_OK;
+  }
+
+ private:
+  ~PrivateBrowsingExitObserver() = default;
+
+  Callback mCallback;
+  static mozilla::StaticRefPtr<PrivateBrowsingExitObserver> sInstance;
+};
+
+mozilla::StaticRefPtr<PrivateBrowsingExitObserver>
+    PrivateBrowsingExitObserver::sInstance;
+
+NS_IMPL_ISUPPORTS(PrivateBrowsingExitObserver, nsIObserver)
+
 }  // namespace
 
 NS_IMPL_ISUPPORTS(nsBaseClipboard::AsyncSetClipboardData,
@@ -363,7 +436,7 @@ nsBaseClipboard::~nsBaseClipboard() {
   }
 }
 
-NS_IMPL_ISUPPORTS(nsBaseClipboard, nsIClipboard)
+NS_IMPL_ISUPPORTS(nsBaseClipboard, nsIClipboard, nsBaseClipboard)
 
 /**
  * Sets the transferable object
@@ -548,7 +621,8 @@ nsresult nsBaseClipboard::SetDataImpl(
 
   const auto& clipboardCache = mCaches[aWhichClipboard];
   MOZ_ASSERT(clipboardCache);
-  if (aTransferable == clipboardCache->GetTransferable() &&
+  if (clipboardCache->IsOnNativeClipboard() &&
+      aTransferable == clipboardCache->GetTransferable() &&
       aOwner == clipboardCache->GetClipboardOwner()) {
     MOZ_CLIPBOARD_LOG("%s: skipping update.", __FUNCTION__);
     return finish(NS_OK);
@@ -590,29 +664,11 @@ nsresult nsBaseClipboard::SetDataImpl(
 
   clipboardCache->Clear();
 
-  nsresult rv = NS_ERROR_FAILURE;
-  if (aTransferable) {
-    mIgnoreEmptyNotification = true;
-    // Reject existing pending asyncSetData request if any.
-    RejectPendingAsyncSetDataRequestIfAny(aWhichClipboard);
-    SanitizeForClipboard(aTransferable);
-    {
-      mozilla::AutoRestore<bool> mutating(mMutatingNativeClipboard);
-      mMutatingNativeClipboard = true;
-      rv = SetNativeClipboardData(aTransferable, aWhichClipboard);
-    }
-    mIgnoreEmptyNotification = false;
+  if (!aTransferable) {
+    return finish(NS_ERROR_FAILURE);
   }
-  if (NS_FAILED(rv)) {
-    MOZ_CLIPBOARD_LOG("%s: setting native clipboard data failed.",
-                      __FUNCTION__);
-    return finish(rv);
-  }
-
-  auto result = GetNativeClipboardSequenceNumber(aWhichClipboard);
+  auto result = WriteNativeClipboardData(aTransferable, aWhichClipboard);
   if (result.isErr()) {
-    MOZ_CLIPBOARD_LOG("%s: getting native clipboard change count failed.",
-                      __FUNCTION__);
     return finish(result.unwrapErr());
   }
 
@@ -623,16 +679,38 @@ nsresult nsBaseClipboard::SetDataImpl(
   return finish(NS_OK);
 }
 
-nsresult nsBaseClipboard::GetDataFromClipboardCache(
-    nsITransferable* aTransferable, ClipboardType aClipboardType) {
+mozilla::Result<int32_t, nsresult> nsBaseClipboard::WriteNativeClipboardData(
+    nsITransferable* aTransferable, ClipboardType aWhichClipboard) {
   MOZ_ASSERT(aTransferable);
-  MOZ_ASSERT(mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled());
-
-  const auto* clipboardCache = GetClipboardCacheIfValid(aClipboardType);
-  if (!clipboardCache) {
-    return NS_ERROR_FAILURE;
+  // See the comment about re-entrant writes in SetDataImpl.
+  if (mMutatingNativeClipboard) {
+    MOZ_CLIPBOARD_LOG("%s: rejecting re-entrant write.", __FUNCTION__);
+    return mozilla::Err(NS_ERROR_IN_PROGRESS);
   }
-  return clipboardCache->GetData(aTransferable);
+
+  nsresult rv;
+  mIgnoreEmptyNotification = true;
+  // Reject existing pending asyncSetData request if any.
+  RejectPendingAsyncSetDataRequestIfAny(aWhichClipboard);
+  SanitizeForClipboard(aTransferable);
+  {
+    mozilla::AutoRestore<bool> mutating(mMutatingNativeClipboard);
+    mMutatingNativeClipboard = true;
+    rv = SetNativeClipboardData(aTransferable, aWhichClipboard);
+  }
+  mIgnoreEmptyNotification = false;
+  if (NS_FAILED(rv)) {
+    MOZ_CLIPBOARD_LOG("%s: setting native clipboard data failed.",
+                      __FUNCTION__);
+    return mozilla::Err(rv);
+  }
+
+  auto result = GetNativeClipboardSequenceNumber(aWhichClipboard);
+  if (result.isErr()) {
+    MOZ_CLIPBOARD_LOG("%s: getting native clipboard change count failed.",
+                      __FUNCTION__);
+  }
+  return result;
 }
 
 /**
@@ -643,8 +721,18 @@ NS_IMETHODIMP nsBaseClipboard::GetData(
     mozilla::dom::WindowContext* aWindowContext) {
   MOZ_CLIPBOARD_LOG("%s: clipboard=%d", __FUNCTION__, aWhichClipboard);
 
-  return GetDataIfSmallerThanNative(aTransferable, 0, aWhichClipboard,
-                                    aWindowContext);
+  return GetDataImpl(aTransferable, 0, aWhichClipboard, aWindowContext,
+                     /* aCheckContentAnalysis */ true);
+}
+
+nsresult nsBaseClipboard::GetDataWithoutContentAnalysis(
+    nsITransferable* aTransferable, ClipboardType aWhichClipboard,
+    mozilla::dom::WindowContext* aRequestingWindowContext) {
+  MOZ_CLIPBOARD_LOG("%s: clipboard=%d", __FUNCTION__, aWhichClipboard);
+
+  return GetDataImpl(aTransferable, 0, aWhichClipboard,
+                     aRequestingWindowContext,
+                     /* aCheckContentAnalysis */ false);
 }
 
 NS_IMETHODIMP nsBaseClipboard::GetDataIfSmallerThan(
@@ -685,6 +773,14 @@ NS_IMETHODIMP nsBaseClipboard::GetDataIfSmallerThanNative(
     mozilla::dom::WindowContext* aWindowContext) {
   MOZ_CLIPBOARD_LOG("%s: clipboard=%d", __FUNCTION__, aWhichClipboard);
 
+  return GetDataImpl(aTransferable, aThreshold, aWhichClipboard, aWindowContext,
+                     /* aCheckContentAnalysis */ true);
+}
+
+nsresult nsBaseClipboard::GetDataImpl(
+    nsITransferable* aTransferable, uint64_t aThreshold,
+    ClipboardType aWhichClipboard, mozilla::dom::WindowContext* aWindowContext,
+    bool aCheckContentAnalysis) {
   if (!aTransferable) {
     NS_ASSERTION(false, "clipboard given a null transferable");
     return NS_ERROR_FAILURE;
@@ -696,17 +792,35 @@ NS_IMETHODIMP nsBaseClipboard::GetDataIfSmallerThanNative(
     return NS_ERROR_FAILURE;
   }
 
-  if (!aThreshold &&
-      mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled()) {
-    if (NS_SUCCEEDED(
-            GetDataFromClipboardCache(aTransferable, aWhichClipboard))) {
-      if (!mozilla::contentanalysis::ContentAnalysis::
-              CheckClipboardContentAnalysisSync(
-                  this, aWindowContext->Canonical(), aTransferable,
-                  aWhichClipboard)) {
+  auto checkContentAnalysis = [&]() -> nsresult {
+    if (aCheckContentAnalysis &&
+        !mozilla::contentanalysis::ContentAnalysis::
+            CheckClipboardContentAnalysisSync(
+                this, aWindowContext ? aWindowContext->Canonical() : nullptr,
+                aTransferable, aWhichClipboard)) {
+      aTransferable->ClearAllData();
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+    return NS_OK;
+  };
+
+  // Data that is not on the native clipboard has to be served from the cache
+  // even when a threshold is given.
+  if (const auto* clipboardCache =
+          GetClipboardCacheForReading(aWhichClipboard, aWindowContext);
+      clipboardCache &&
+      (!aThreshold || !clipboardCache->IsOnNativeClipboard())) {
+    if (NS_SUCCEEDED(clipboardCache->GetData(aTransferable))) {
+      if (aThreshold &&
+          TransferableExceedsThreshold(aTransferable, aThreshold)) {
         aTransferable->ClearAllData();
-        return NS_ERROR_CONTENT_BLOCKED;
+        return NS_ERROR_CLIPBOARD_TOO_BIG;
       }
+      return checkContentAnalysis();
+    }
+    // The native clipboard holds something other than what this requester
+    // last copied, so don't fill flavors the cached data lacks from it.
+    if (!clipboardCache->IsOnNativeClipboard()) {
       return NS_OK;
     }
   }
@@ -742,14 +856,7 @@ NS_IMETHODIMP nsBaseClipboard::GetDataIfSmallerThanNative(
     return NS_ERROR_CLIPBOARD_TOO_BIG;
   }
 
-  if (!mozilla::contentanalysis::ContentAnalysis::
-          CheckClipboardContentAnalysisSync(this, aWindowContext->Canonical(),
-                                            aTransferable, aWhichClipboard)) {
-    aTransferable->ClearAllData();
-    return NS_ERROR_CONTENT_BLOCKED;
-  }
-
-  return NS_OK;
+  return checkContentAnalysis();
 }
 
 void nsBaseClipboard::MaybeRetryGetAvailableFlavors(
@@ -862,14 +969,13 @@ NS_IMETHODIMP nsBaseClipboard::GetDataSnapshot(
   }
 
   // If cache data is valid, we are the last ones to put something on the native
-  // clipboard, then check if the data is from the same-origin page,
-  if (auto* clipboardCache = GetClipboardCacheIfValid(aWhichClipboard)) {
-    nsCOMPtr<nsITransferable> trans = clipboardCache->GetTransferable();
-    MOZ_ASSERT(trans);
-
-    if (nsCOMPtr<nsIPrincipal> principal = trans->GetDataPrincipal()) {
+  // clipboard (or kept data off it for this requester), then check if the data
+  // is from the same-origin page,
+  if (auto* clipboardCache = GetClipboardCacheIfValid(aWhichClipboard);
+      clipboardCache && clipboardCache->MayRead(aRequestingWindowContext)) {
+    if (nsCOMPtr<nsIPrincipal> principal = clipboardCache->GetDataPrincipal()) {
       if (aRequestingPrincipal->Subsumes(principal)) {
-        MOZ_CLIPBOARD_LOG("%s: native clipboard data is from same-origin page.",
+        MOZ_CLIPBOARD_LOG("%s: clipboard data is from same-origin page.",
                           __FUNCTION__);
         GetDataSnapshotInternal(aFlavorList, aWhichClipboard,
                                 aRequestingWindowContext, aCallback);
@@ -890,14 +996,11 @@ nsBaseClipboard::MaybeCreateGetRequestFromClipboardCache(
     mozilla::dom::WindowContext* aRequestingWindowContext) {
   MOZ_DIAGNOSTIC_ASSERT(nsIClipboard::IsClipboardTypeSupported(aClipboardType));
 
-  if (!mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled()) {
-    return nullptr;
-  }
-
-  // If we were the last ones to put something on the native clipboard, then
-  // just use the cached transferable. Otherwise clear it because it isn't
-  // relevant any more.
-  ClipboardCache* clipboardCache = GetClipboardCacheIfValid(aClipboardType);
+  // If we were the last ones to put something on the native clipboard (or
+  // kept data off it for this requester), then just use the cached
+  // transferable.
+  ClipboardCache* clipboardCache =
+      GetClipboardCacheForReading(aClipboardType, aRequestingWindowContext);
   if (!clipboardCache) {
     return nullptr;
   }
@@ -1058,10 +1161,11 @@ NS_IMETHODIMP nsBaseClipboard::EmptyClipboard(ClipboardType aWhichClipboard) {
   MOZ_ASSERT(clipboardCache);
 
   if (mIgnoreEmptyNotification) {
-    MOZ_DIAGNOSTIC_ASSERT(!clipboardCache->GetTransferable() &&
-                              !clipboardCache->GetClipboardOwner() &&
-                              clipboardCache->GetSequenceNumber() == -1,
-                          "How did we have data in clipboard cache here?");
+    // Data that is not on the native clipboard may stay cached while we write
+    // something else to the native clipboard.
+    MOZ_DIAGNOSTIC_ASSERT(
+        !clipboardCache->HasData() || !clipboardCache->IsOnNativeClipboard(),
+        "How did we have data in clipboard cache here?");
     return NS_OK;
   }
 
@@ -1075,8 +1179,10 @@ nsBaseClipboard::GetFlavorsFromClipboardCache(ClipboardType aClipboardType) {
   MOZ_ASSERT(mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled());
   MOZ_ASSERT(nsIClipboard::IsClipboardTypeSupported(aClipboardType));
 
+  // Data that is not on the native clipboard doesn't tell what flavors the
+  // clipboard has.
   const auto* clipboardCache = GetClipboardCacheIfValid(aClipboardType);
-  if (!clipboardCache) {
+  if (!clipboardCache || !clipboardCache->IsOnNativeClipboard()) {
     return mozilla::Err(NS_ERROR_FAILURE);
   }
 
@@ -1237,8 +1343,10 @@ nsTArray<nsCString> nsBaseClipboard::GetWebCustomFormatsFromClipboard(
   // cache entry means this Firefox process owns the current clipboard data.
   // When the cache is valid, allow the read; otherwise honour the pref.
   // This makes the gate work consistently on Windows and Linux, where the
-  // read path doesn't otherwise consult the cache.
-  if (!GetClipboardCacheIfValid(aWhichClipboard) &&
+  // read path doesn't otherwise consult the cache. Cached data that is not on
+  // the native clipboard says nothing about who owns it.
+  const auto* clipboardCache = GetClipboardCacheIfValid(aWhichClipboard);
+  if ((!clipboardCache || !clipboardCache->IsOnNativeClipboard()) &&
       !mozilla::StaticPrefs::
           clipboard_readCustomFormatsFromClipboard_enabled()) {
     return results;
@@ -1292,6 +1400,13 @@ void nsBaseClipboard::ClearClipboardCache(ClipboardType aClipboardType) {
   MOZ_ASSERT(nsIClipboard::IsClipboardTypeSupported(aClipboardType));
   const mozilla::UniquePtr<ClipboardCache>& cache = mCaches[aClipboardType];
   MOZ_ASSERT(cache);
+  // This is called when we lose ownership of the native clipboard, which
+  // doesn't affect data that isn't on it. (GTK calls this synchronously while
+  // we write to the native clipboard ourselves.) Such data is still dropped
+  // when the native clipboard's sequence number changes.
+  if (!cache->IsOnNativeClipboard()) {
+    return;
+  }
   cache->Clear();
 }
 
@@ -1492,14 +1607,16 @@ NS_IMETHODIMP nsBaseClipboard::ClipboardDataSnapshot::GetData(
           });
 
   if (mFromCache) {
-    const auto* clipboardCache =
-        mClipboard->GetClipboardCacheIfValid(mClipboardType);
+    const auto* clipboardCache = mClipboard->GetClipboardCacheForReading(
+        mClipboardType, mRequestingWindowContext);
     // `IsValid()` above ensures we should get a valid cache and matched
     // sequence number here.
     MOZ_DIAGNOSTIC_ASSERT(clipboardCache);
     MOZ_DIAGNOSTIC_ASSERT(clipboardCache->GetSequenceNumber() ==
                           mSequenceNumber);
-    if (NS_SUCCEEDED(clipboardCache->GetData(aTransferable))) {
+    // Never fall back to the native clipboard for data that isn't on it.
+    if (NS_SUCCEEDED(clipboardCache->GetData(aTransferable)) ||
+        !clipboardCache->IsOnNativeClipboard()) {
       mozilla::contentanalysis::ContentAnalysis::CheckClipboardContentAnalysis(
           mClipboard,
           mRequestingWindowContext ? mRequestingWindowContext->Canonical()
@@ -1569,14 +1686,16 @@ NS_IMETHODIMP nsBaseClipboard::ClipboardDataSnapshot::GetDataSync(
   MOZ_ASSERT(mClipboard);
 
   if (mFromCache) {
-    const auto* clipboardCache =
-        mClipboard->GetClipboardCacheIfValid(mClipboardType);
+    const auto* clipboardCache = mClipboard->GetClipboardCacheForReading(
+        mClipboardType, mRequestingWindowContext);
     // `IsValid()` above ensures we should get a valid cache and matched
     // sequence number here.
     MOZ_DIAGNOSTIC_ASSERT(clipboardCache);
     MOZ_DIAGNOSTIC_ASSERT(clipboardCache->GetSequenceNumber() ==
                           mSequenceNumber);
-    if (NS_SUCCEEDED(clipboardCache->GetData(aTransferable))) {
+    // Never fall back to the native clipboard for data that isn't on it.
+    if (NS_SUCCEEDED(clipboardCache->GetData(aTransferable)) ||
+        !clipboardCache->IsOnNativeClipboard()) {
       bool shouldAllowContent = mozilla::contentanalysis::ContentAnalysis::
           CheckClipboardContentAnalysisSync(
               mClipboard,
@@ -1629,8 +1748,8 @@ bool nsBaseClipboard::ClipboardDataSnapshot::IsValid() {
   // If the data should from cache, check if cache is still valid or the
   // sequence numbers are matched.
   if (mFromCache) {
-    const auto* clipboardCache =
-        mClipboard->GetClipboardCacheIfValid(mClipboardType);
+    const auto* clipboardCache = mClipboard->GetClipboardCacheForReading(
+        mClipboardType, mRequestingWindowContext);
     if (!clipboardCache) {
       mClipboard = nullptr;
       return false;
@@ -1789,7 +1908,7 @@ nsBaseClipboard::ClipboardCache* nsBaseClipboard::GetClipboardCacheIfValid(
   const mozilla::UniquePtr<ClipboardCache>& cache = mCaches[aClipboardType];
   MOZ_ASSERT(cache);
 
-  if (!cache->GetTransferable()) {
+  if (!cache->HasData()) {
     MOZ_ASSERT(cache->GetSequenceNumber() == -1);
     return nullptr;
   }
@@ -1808,19 +1927,153 @@ nsBaseClipboard::ClipboardCache* nsBaseClipboard::GetClipboardCacheIfValid(
   return cache.get();
 }
 
-void nsBaseClipboard::ClipboardCache::Clear() {
-  if (mClipboardOwner) {
-    mClipboardOwner->LosingOwnership(mTransferable);
-    mClipboardOwner = nullptr;
+nsBaseClipboard::ClipboardCache* nsBaseClipboard::GetClipboardCacheForReading(
+    ClipboardType aClipboardType,
+    mozilla::dom::WindowContext* aRequestingWindowContext) {
+  ClipboardCache* cache = GetClipboardCacheIfValid(aClipboardType);
+  if (!cache) {
+    return nullptr;
   }
-  mTransferable = nullptr;
+  if (!cache->IsOnNativeClipboard()) {
+    return cache->MayRead(aRequestingWindowContext) ? cache : nullptr;
+  }
+  return mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled()
+             ? cache
+             : nullptr;
+}
+
+/* static */
+bool nsBaseClipboard::TransferableExceedsThreshold(
+    nsITransferable* aTransferable, uint64_t aThreshold) {
+  nsTArray<nsCString> flavors;
+  if (NS_FAILED(aTransferable->FlavorsTransferableCanExport(flavors))) {
+    return false;
+  }
+  for (const auto& flavor : flavors) {
+    nsCOMPtr<nsISupports> data;
+    if (NS_FAILED(aTransferable->GetTransferData(flavor.get(),
+                                                 getter_AddRefs(data)))) {
+      continue;
+    }
+    if (nsCOMPtr<nsISupportsString> stringData = do_QueryInterface(data)) {
+      nsAutoString str;
+      if (NS_SUCCEEDED(stringData->GetData(str)) &&
+          uint64_t(str.Length()) * sizeof(char16_t) > aThreshold) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+nsBaseClipboard::ClipboardCache::~ClipboardCache() {
+  // In order to notify the old clipboard owner.
+  Clear();
+}
+
+void nsBaseClipboard::ClipboardCache::Clear() {
+  StopObservingPrivateBrowsingExit();
+  nsCOMPtr<nsIClipboardOwner> owner = std::move(mClipboardOwner);
+  nsCOMPtr<nsITransferable> transferable = std::move(mTransferable);
   mSequenceNumber = -1;
+  mInnerWindowId.reset();
+  mReadRestriction.reset();
+  // Notify the owner only once the cache is empty, in case it reacts by
+  // touching the clipboard.
+  if (owner) {
+    owner->LosingOwnership(transferable);
+  }
+}
+
+bool nsBaseClipboard::ClipboardCache::UpdateNotOnNativeClipboard(
+    nsITransferable* aTransferable, nsIClipboardOwner* aClipboardOwner,
+    int32_t aSequenceNumber, mozilla::dom::WindowContext* aSourceWindow) {
+  MOZ_ASSERT(aTransferable);
+  MOZ_ASSERT(aSourceWindow);
+  Clear();
+
+  nsCOMPtr<nsIPrincipal> principal = aTransferable->GetDataPrincipal();
+  if (!principal) {
+    principal = aSourceWindow->Canonical()->DocumentPrincipal();
+  }
+  mozilla::dom::WindowContext* top = aSourceWindow->TopWindowContext();
+  if (!principal || !top) {
+    return false;
+  }
+
+  MOZ_CLIPBOARD_LOG(
+      "%s: caching data that is not on the native clipboard for sequence "
+      "number %d",
+      __FUNCTION__, aSequenceNumber);
+  mTransferable = aTransferable;
+  mClipboardOwner = aClipboardOwner;
+  mSequenceNumber = aSequenceNumber;
+  mInnerWindowId = mozilla::Some(aSourceWindow->InnerWindowId());
+  mReadRestriction.emplace(ReadRestriction{top->InnerWindowId(), principal});
+
+  if (principal->GetIsInPrivateBrowsing()) {
+    StartObservingPrivateBrowsingExit();
+  }
+  return true;
+}
+
+void nsBaseClipboard::ClipboardCache::Rekey(int32_t aSequenceNumber) {
+  MOZ_ASSERT(HasData());
+  MOZ_ASSERT(!IsOnNativeClipboard());
+  MOZ_CLIPBOARD_LOG("%s: sequence number %d -> %d", __FUNCTION__,
+                    mSequenceNumber, aSequenceNumber);
+  mSequenceNumber = aSequenceNumber;
+}
+
+bool nsBaseClipboard::ClipboardCache::MayRead(
+    mozilla::dom::WindowContext* aRequestingWindow) const {
+  if (IsOnNativeClipboard()) {
+    return true;
+  }
+  if (!mozilla::contentanalysis::ContentAnalysis::IsSamePageAndSite(
+          aRequestingWindow ? aRequestingWindow->Canonical() : nullptr,
+          mReadRestriction->mSourceTopInnerWindowId,
+          mReadRestriction->mSourcePrincipal)) {
+    MOZ_CLIPBOARD_LOG(
+        "%s: requesting window may not read data that is not on the native "
+        "clipboard.",
+        __FUNCTION__);
+    return false;
+  }
+  return true;
+}
+
+nsIPrincipal* nsBaseClipboard::ClipboardCache::GetDataPrincipal() const {
+  if (mReadRestriction) {
+    return mReadRestriction->mSourcePrincipal;
+  }
+  return mTransferable ? mTransferable->GetDataPrincipal() : nullptr;
+}
+
+void nsBaseClipboard::ClipboardCache::StartObservingPrivateBrowsingExit() {
+  mObservingPrivateBrowsingExit = true;
+  PrivateBrowsingExitObserver::Get()->Start([this]() {
+    MOZ_CLIPBOARD_LOG(
+        "%s: dropping private-browsing data that is not on the native "
+        "clipboard",
+        __FUNCTION__);
+    Clear();
+  });
+}
+
+void nsBaseClipboard::ClipboardCache::StopObservingPrivateBrowsingExit() {
+  if (!mObservingPrivateBrowsingExit) {
+    return;
+  }
+  mObservingPrivateBrowsingExit = false;
+  if (auto* observer = PrivateBrowsingExitObserver::GetIfExists()) {
+    observer->Stop();
+  }
 }
 
 nsresult nsBaseClipboard::ClipboardCache::GetData(
     nsITransferable* aTransferable) const {
   MOZ_ASSERT(aTransferable);
-  MOZ_ASSERT(mozilla::StaticPrefs::widget_clipboard_use_cached_data_enabled());
 
   // get flavor list that includes all acceptable flavors (including ones
   // obtained through conversion)
