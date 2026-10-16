@@ -22,6 +22,7 @@ extern mozilla::LazyLogModule gWidgetClipboardLog;
   MOZ_LOG_TEST(gWidgetClipboardLog, mozilla::LogLevel::Debug)
 
 class nsIContentAnalysisLocalCopyInfo;
+class nsIContentAnalysisResponse;
 class nsITransferable;
 class nsIClipboardOwner;
 class nsIPrincipal;
@@ -204,9 +205,10 @@ class nsBaseClipboard : public nsIClipboard {
   //
   // In Enterprise builds the copy may also be kept in the global clipboard
   // cache for the copying page (see KeepInClipboardCache), while its verdict
-  // is pending and after the verdict blocks it. The copy is then the cache
-  // entry's owner, which is how it hears that the kept data was dropped, and
-  // it stays in mPendingCopy until then.
+  // is pending, while the user has yet to answer a warning about it, and after
+  // the verdict blocks it. The copy is then the cache entry's owner, which is
+  // how it hears that the kept data was dropped, and it stays in mPendingCopy
+  // until then.
   class PendingCopy final : public nsIClipboardOwner {
    public:
     NS_DECL_ISUPPORTS
@@ -233,6 +235,8 @@ class nsBaseClipboard : public nsIClipboard {
     enum class KeptState : uint8_t {
       // Its content analysis verdict.
       ePending,
+      // The user's answer to a content analysis warning about the copy.
+      eWarn,
       // Nothing: content analysis blocked the copy.
       eBlocked,
     };
@@ -244,6 +248,8 @@ class nsBaseClipboard : public nsIClipboard {
     // drops the kept data, which resets this, before it goes away.
     nsBaseClipboard* mKeptBy = nullptr;
     KeptState mKeptState = KeptState::ePending;
+    // Identifies the undecided warning while mKeptState is eWarn.
+    nsCString mWarnRequestToken;
 
    private:
     ~PendingCopy() = default;
@@ -272,6 +278,14 @@ class nsBaseClipboard : public nsIClipboard {
   // Called on the main thread when a deferred copy's verdict arrives.
   void OnCopyContentAnalysisResult(ClipboardType aWhichClipboard,
                                    PendingCopy* aPendingCopy, bool aAllowed);
+
+  // Called on the main thread when a deferred copy that is kept in the
+  // clipboard cache gets a warn verdict the user has yet to answer. Writes the
+  // warn placeholder, keeps the copy for the copying page, and completes the
+  // copy so the page can go on.
+  void OnCopyContentAnalysisWarn(ClipboardType aWhichClipboard,
+                                 PendingCopy* aPendingCopy,
+                                 nsIContentAnalysisResponse* aResponse);
 
   // Replaces the clipboard contents with a localized notice that the copy was
   // not permitted.
