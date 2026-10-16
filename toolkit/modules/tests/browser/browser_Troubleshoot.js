@@ -1352,6 +1352,9 @@ const SNAPSHOT_SCHEMA = {
         requestCount: {
           type: "number",
         },
+        isBuiltInAgent: {
+          type: "boolean",
+        },
       },
     },
   },
