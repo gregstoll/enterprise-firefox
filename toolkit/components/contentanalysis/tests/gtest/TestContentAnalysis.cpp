@@ -243,10 +243,10 @@ RefPtr<ContentAnalysisDiagnosticInfo> ContentAnalysisTest::GetDiagnosticInfo(
         int64_t requestCount;
         EXPECT_TRUE(JS::ToInt64(aCx, value, &requestCount));
         EXPECT_TRUE(JS_GetProperty(aCx, obj, "isBuiltInAgent", &value));
-        bool isBuiltInVersion = JS::ToBoolean(value);
+        bool isBuiltInAgent = JS::ToBoolean(value);
         diagnosticInfo = MakeRefPtr<ContentAnalysisDiagnosticInfo>(
             connectedToAgent, agentPath, failedSignatureVerification,
-            requestCount, isBuiltInVersion);
+            requestCount, isBuiltInAgent);
 
         gotResponse = true;
         return nullptr;
